@@ -20,11 +20,21 @@ import type {
   TransactionContext,
   User,
 } from '@sentry/types';
-import { consoleSandbox, dateTimestampInSeconds, getGlobalSingleton, GLOBAL_OBJ, logger, uuid4 } from '@sentry/utils';
+import {
+  GLOBAL_OBJ,
+  consoleSandbox,
+  dateTimestampInSeconds,
+  getGlobalSingleton,
+  isThenable,
+  logger,
+  uuid4,
+} from '@sentry/utils';
 
 import { DEFAULT_ENVIRONMENT } from './constants';
+import { DEBUG_BUILD } from './debug-build';
 import { Scope } from './scope';
 import { closeSession, makeSession, updateSession } from './session';
+import { SDK_VERSION } from './version';
 
 /**
  * API compatibility version of this hub.
@@ -34,7 +44,7 @@ import { closeSession, makeSession, updateSession } from './session';
  *
  * @hidden
  */
-export const API_VERSION = 4;
+export const API_VERSION = parseFloat(SDK_VERSION);
 
 /**
  * Default maximum number of breadcrumbs added to an event. Can be overwritten
@@ -102,6 +112,8 @@ export class Hub implements HubInterface {
   /** Contains the last event id of a captured event.  */
   private _lastEventId?: string;
 
+  private _isolationScope: Scope;
+
   /**
    * Creates a new instance of the hub, will push one {@link Layer} into the
    * internal stack on creation.
@@ -110,11 +122,18 @@ export class Hub implements HubInterface {
    * @param scope bound to the hub.
    * @param version number, higher number means higher priority.
    */
-  public constructor(client?: Client, scope: Scope = new Scope(), private readonly _version: number = API_VERSION) {
+  public constructor(
+    client?: Client,
+    scope: Scope = new Scope(),
+    isolationScope = new Scope(),
+    private readonly _version: number = API_VERSION,
+  ) {
     this._stack = [{ scope }];
     if (client) {
       this.bindClient(client);
     }
+
+    this._isolationScope = isolationScope;
   }
 
   /**
@@ -137,10 +156,12 @@ export class Hub implements HubInterface {
 
   /**
    * @inheritDoc
+   *
+   * @deprecated Use `withScope` instead.
    */
   public pushScope(): Scope {
     // We want to clone the content of prev scope
-    const scope = Scope.clone(this.getScope());
+    const scope = this.getScope().clone();
     this.getStack().push({
       client: this.getClient(),
       scope,
@@ -150,6 +171,8 @@ export class Hub implements HubInterface {
 
   /**
    * @inheritDoc
+   *
+   * @deprecated Use `withScope` instead.
    */
   public popScope(): boolean {
     if (this.getStack().length <= 1) return false;
@@ -159,13 +182,38 @@ export class Hub implements HubInterface {
   /**
    * @inheritDoc
    */
-  public withScope(callback: (scope: Scope) => void): void {
+  public withScope<T>(callback: (scope: Scope) => T): T {
+    // eslint-disable-next-line deprecation/deprecation
     const scope = this.pushScope();
+
+    let maybePromiseResult: T;
     try {
-      callback(scope);
-    } finally {
+      maybePromiseResult = callback(scope);
+    } catch (e) {
+      // eslint-disable-next-line deprecation/deprecation
       this.popScope();
+      throw e;
     }
+
+    if (isThenable(maybePromiseResult)) {
+      // @ts-expect-error - isThenable returns the wrong type
+      return maybePromiseResult.then(
+        res => {
+          // eslint-disable-next-line deprecation/deprecation
+          this.popScope();
+          return res;
+        },
+        e => {
+          // eslint-disable-next-line deprecation/deprecation
+          this.popScope();
+          throw e;
+        },
+      );
+    }
+
+    // eslint-disable-next-line deprecation/deprecation
+    this.popScope();
+    return maybePromiseResult;
   }
 
   /**
@@ -178,6 +226,11 @@ export class Hub implements HubInterface {
   /** Returns the scope of the top stack. */
   public getScope(): Scope {
     return this.getStackTop().scope;
+  }
+
+  /** @inheritdoc */
+  public getIsolationScope(): Scope {
+    return this._isolationScope;
   }
 
   /** Returns the scope stack for domains or the process. */
@@ -333,6 +386,8 @@ export class Hub implements HubInterface {
 
   /**
    * @inheritDoc
+   *
+   * @deprecated Use `getScope()` directly.
    */
   public configureScope(callback: (scope: Scope) => void): void {
     const { scope, client } = this.getStackTop();
@@ -362,7 +417,7 @@ export class Hub implements HubInterface {
     try {
       return client.getIntegration(integration);
     } catch (_oO) {
-      __DEBUG_BUILD__ && logger.warn(`Cannot retrieve integration ${integration.id} from the current Hub`);
+      DEBUG_BUILD && logger.warn(`Cannot retrieve integration ${integration.id} from the current Hub`);
       return null;
     }
   }
@@ -373,16 +428,14 @@ export class Hub implements HubInterface {
   public startTransaction(context: TransactionContext, customSamplingContext?: CustomSamplingContext): Transaction {
     const result = this._callExtensionMethod<Transaction>('startTransaction', context, customSamplingContext);
 
-    if (__DEBUG_BUILD__ && !result) {
+    if (DEBUG_BUILD && !result) {
       const client = this.getClient();
       if (!client) {
-        // eslint-disable-next-line no-console
-        console.warn(
+        logger.warn(
           "Tracing extension 'startTransaction' is missing. You should 'init' the SDK before calling 'startTransaction'",
         );
       } else {
-        // eslint-disable-next-line no-console
-        console.warn(`Tracing extension 'startTransaction' has not been added. Call 'addTracingExtensions' before calling 'init':
+        logger.warn(`Tracing extension 'startTransaction' has not been added. Call 'addTracingExtensions' before calling 'init':
 Sentry.addTracingExtensions();
 Sentry.init({...});
 `);
@@ -505,7 +558,7 @@ Sentry.init({...});
     if (sentry && sentry.extensions && typeof sentry.extensions[method] === 'function') {
       return sentry.extensions[method].apply(this, args);
     }
-    __DEBUG_BUILD__ && logger.warn(`Extension method ${method} couldn't be found, doing nothing.`);
+    DEBUG_BUILD && logger.warn(`Extension method ${method} couldn't be found, doing nothing.`);
   }
 }
 
@@ -559,6 +612,15 @@ export function getCurrentHub(): Hub {
   return getGlobalHub(registry);
 }
 
+/**
+ * Get the currently active isolation scope.
+ * The isolation scope is active for the current exection context,
+ * meaning that it will remain stable for the same Hub.
+ */
+export function getIsolationScope(): Scope {
+  return getCurrentHub().getIsolationScope();
+}
+
 function getGlobalHub(registry: Carrier = getMainCarrier()): Hub {
   // If there's no hub, or its an old API, assign a new one
   if (!hasHubOnCarrier(registry) || getHubFromCarrier(registry).isOlderThan(API_VERSION)) {
@@ -577,8 +639,10 @@ function getGlobalHub(registry: Carrier = getMainCarrier()): Hub {
 export function ensureHubOnCarrier(carrier: Carrier, parent: Hub = getGlobalHub()): void {
   // If there's no hub on current domain, or it's an old API, assign a new one
   if (!hasHubOnCarrier(carrier) || getHubFromCarrier(carrier).isOlderThan(API_VERSION)) {
-    const globalHubTopStack = parent.getStackTop();
-    setHubOnCarrier(carrier, new Hub(globalHubTopStack.client, Scope.clone(globalHubTopStack.scope)));
+    const client = parent.getClient();
+    const scope = parent.getScope();
+    const isolationScope = parent.getIsolationScope();
+    setHubOnCarrier(carrier, new Hub(client, scope.clone(), isolationScope.clone()));
   }
 }
 

@@ -1,7 +1,7 @@
-import { getCurrentHub } from '@sentry/core';
-import type { Integration } from '@sentry/types';
-import { addInstrumentationHandler, severityLevelFromString } from '@sentry/utils';
 import * as util from 'util';
+import { addBreadcrumb, getClient } from '@sentry/core';
+import type { Client, Integration } from '@sentry/types';
+import { addConsoleInstrumentationHandler, severityLevelFromString } from '@sentry/utils';
 
 /** Console module integration */
 export class Console implements Integration {
@@ -19,14 +19,17 @@ export class Console implements Integration {
    * @inheritDoc
    */
   public setupOnce(): void {
-    addInstrumentationHandler('console', ({ args, level }: { args: unknown[]; level: string }) => {
-      const hub = getCurrentHub();
+    // noop
+  }
 
-      if (!hub.getIntegration(Console)) {
+  /** @inheritdoc */
+  public setup(client: Client): void {
+    addConsoleInstrumentationHandler(({ args, level }) => {
+      if (getClient() !== client) {
         return;
       }
 
-      hub.addBreadcrumb(
+      addBreadcrumb(
         {
           category: 'console',
           level: severityLevelFromString(level),

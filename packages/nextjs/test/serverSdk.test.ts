@@ -1,6 +1,6 @@
 import { runWithAsyncContext } from '@sentry/core';
 import * as SentryNode from '@sentry/node';
-import { getCurrentHub, NodeClient } from '@sentry/node';
+import { NodeClient, getCurrentHub } from '@sentry/node';
 import type { Integration } from '@sentry/types';
 import { GLOBAL_OBJ, logger } from '@sentry/utils';
 
@@ -106,9 +106,9 @@ describe('Server init()', () => {
     const transportSend = jest.spyOn(hub.getClient()!.getTransport()!, 'send');
 
     const transaction = hub.startTransaction({ name: '/404' });
-    transaction.finish();
+    transaction.end();
 
-    // We need to flush because the event processor pipeline is async whereas transaction.finish() is sync.
+    // We need to flush because the event processor pipeline is async whereas transaction.end() is sync.
     await SentryNode.flush();
 
     expect(transportSend).not.toHaveBeenCalled();

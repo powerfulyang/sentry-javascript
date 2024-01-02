@@ -1,9 +1,10 @@
-import type { Scope } from '@sentry/core';
-import { getCurrentHub } from '@sentry/core';
+import { captureException } from '@sentry/core';
+import { getClient } from '@sentry/core';
 import type { Integration } from '@sentry/types';
 import { logger } from '@sentry/utils';
 
 import type { NodeClient } from '../client';
+import { DEBUG_BUILD } from '../debug-build';
 import { logAndExitProcess } from './utils/errorhandling';
 
 type OnFatalErrorHandler = (firstError: Error, secondError?: Error) => void;
@@ -49,11 +50,6 @@ export class OnUncaughtException implements Integration {
    */
   public name: string = OnUncaughtException.id;
 
-  /**
-   * @inheritDoc
-   */
-  public readonly handler: (error: Error) => void = this._makeErrorHandler();
-
   // CAREFUL: Please think twice before updating the way _options looks because the Next.js SDK depends on it in `index.server.ts`
   private readonly _options: OnUncaughtExceptionOptions;
 
@@ -68,30 +64,45 @@ export class OnUncaughtException implements Integration {
   }
 
   /**
+   * @deprecated This does nothing anymore.
+   */
+  public readonly handler: (error: Error) => void = () => {
+    // noop
+  };
+
+  /**
    * @inheritDoc
    */
   public setupOnce(): void {
-    global.process.on('uncaughtException', this.handler);
+    // noop
   }
 
-  /**
-   * @hidden
-   */
-  private _makeErrorHandler(): (error: Error) => void {
-    const timeout = 2000;
-    let caughtFirstError: boolean = false;
-    let caughtSecondError: boolean = false;
-    let calledFatalError: boolean = false;
-    let firstError: Error;
+  /** @inheritdoc */
+  public setup(client: NodeClient): void {
+    global.process.on('uncaughtException', makeErrorHandler(client, this._options));
+  }
+}
 
-    return (error: Error): void => {
+type ErrorHandler = { _errorHandler: boolean } & ((error: Error) => void);
+
+/** Exported only for tests */
+export function makeErrorHandler(client: NodeClient, options: OnUncaughtExceptionOptions): ErrorHandler {
+  const timeout = 2000;
+  let caughtFirstError: boolean = false;
+  let caughtSecondError: boolean = false;
+  let calledFatalError: boolean = false;
+  let firstError: Error;
+
+  const clientOptions = client.getOptions();
+
+  return Object.assign(
+    (error: Error): void => {
       let onFatalError: OnFatalErrorHandler = logAndExitProcess;
-      const client = getCurrentHub().getClient<NodeClient>();
 
-      if (this._options.onFatalError) {
-        onFatalError = this._options.onFatalError;
-      } else if (client && client.getOptions().onFatalError) {
-        onFatalError = client.getOptions().onFatalError as OnFatalErrorHandler;
+      if (options.onFatalError) {
+        onFatalError = options.onFatalError;
+      } else if (clientOptions.onFatalError) {
+        onFatalError = clientOptions.onFatalError as OnFatalErrorHandler;
       }
 
       // Attaching a listener to `uncaughtException` will prevent the node process from exiting. We generally do not
@@ -106,7 +117,7 @@ export class OnUncaughtException implements Integration {
           // There are 3 listeners we ignore:
           listener.name === 'domainUncaughtExceptionClear' || // as soon as we're using domains this listener is attached by node itself
           (listener.tag && listener.tag === 'sentry_tracingErrorCallback') || // the handler we register for tracing
-          listener === this.handler // the handler we register in this integration
+          (listener as ErrorHandler)._errorHandler // the handler we register in this integration
         ) {
           return acc;
         } else {
@@ -115,40 +126,37 @@ export class OnUncaughtException implements Integration {
       }, 0);
 
       const processWouldExit = userProvidedListenersCount === 0;
-      const shouldApplyFatalHandlingLogic = this._options.exitEvenIfOtherHandlersAreRegistered || processWouldExit;
+      const shouldApplyFatalHandlingLogic = options.exitEvenIfOtherHandlersAreRegistered || processWouldExit;
 
       if (!caughtFirstError) {
-        const hub = getCurrentHub();
-
         // this is the first uncaught error and the ultimate reason for shutting down
         // we want to do absolutely everything possible to ensure it gets captured
         // also we want to make sure we don't go recursion crazy if more errors happen after this one
         firstError = error;
         caughtFirstError = true;
 
-        if (hub.getIntegration(OnUncaughtException)) {
-          hub.withScope((scope: Scope) => {
-            scope.setLevel('fatal');
-            hub.captureException(error, {
-              originalException: error,
-              data: { mechanism: { handled: false, type: 'onuncaughtexception' } },
-            });
-            if (!calledFatalError && shouldApplyFatalHandlingLogic) {
-              calledFatalError = true;
-              onFatalError(error);
-            }
+        if (getClient() === client) {
+          captureException(error, {
+            originalException: error,
+            captureContext: {
+              level: 'fatal',
+            },
+            mechanism: {
+              handled: false,
+              type: 'onuncaughtexception',
+            },
           });
-        } else {
-          if (!calledFatalError && shouldApplyFatalHandlingLogic) {
-            calledFatalError = true;
-            onFatalError(error);
-          }
+        }
+
+        if (!calledFatalError && shouldApplyFatalHandlingLogic) {
+          calledFatalError = true;
+          onFatalError(error);
         }
       } else {
         if (shouldApplyFatalHandlingLogic) {
           if (calledFatalError) {
             // we hit an error *after* calling onFatalError - pretty boned at this point, just shut it down
-            __DEBUG_BUILD__ &&
+            DEBUG_BUILD &&
               logger.warn(
                 'uncaught exception after calling fatal error shutdown callback - this is bad! forcing shutdown',
               );
@@ -181,6 +189,7 @@ export class OnUncaughtException implements Integration {
           }
         }
       }
-    };
-  }
+    },
+    { _errorHandler: true },
+  );
 }

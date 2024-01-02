@@ -6,7 +6,7 @@ import type { UserIntegrationsFunction } from '@sentry/utils';
 import { logger } from '@sentry/utils';
 import { JSDOM } from 'jsdom';
 
-import { init, Integrations, nextRouterInstrumentation } from '../src/client';
+import { Integrations, init, nextRouterInstrumentation } from '../src/client';
 
 const reactInit = jest.spyOn(SentryReact, 'init');
 const captureEvent = jest.spyOn(BaseClient.prototype, 'captureEvent');
@@ -90,7 +90,7 @@ describe('Client init()', () => {
     const transportSend = jest.spyOn(hub.getClient()!.getTransport()!, 'send');
 
     const transaction = hub.startTransaction({ name: '/404' });
-    transaction.finish();
+    transaction.end();
 
     expect(transportSend).not.toHaveBeenCalled();
     expect(captureEvent.mock.results[0].value).toBeUndefined();

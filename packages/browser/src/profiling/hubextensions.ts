@@ -2,12 +2,13 @@
 import type { Transaction } from '@sentry/types';
 import { logger, timestampInSeconds, uuid4 } from '@sentry/utils';
 
+import { DEBUG_BUILD } from '../debug-build';
 import { WINDOW } from '../helpers';
 import type { JSSelfProfile } from './jsSelfProfiling';
 import {
+  MAX_PROFILE_DURATION_MS,
   addProfileToGlobalCache,
   isAutomatedPageLoadTransaction,
-  MAX_PROFILE_DURATION_MS,
   shouldProfileTransaction,
   startJSSelfProfile,
 } from './utils';
@@ -21,7 +22,7 @@ import {
  */
 export function onProfilingStartRouteTransaction(transaction: Transaction | undefined): Transaction | undefined {
   if (!transaction) {
-    if (__DEBUG_BUILD__) {
+    if (DEBUG_BUILD) {
       logger.log('[Profiling] Transaction is undefined, skipping profiling');
     }
     return transaction;
@@ -54,7 +55,7 @@ export function startProfileForTransaction(transaction: Transaction): Transactio
     return transaction;
   }
 
-  if (__DEBUG_BUILD__) {
+  if (DEBUG_BUILD) {
     logger.log(`[Profiling] started profiling transaction: ${transaction.name || transaction.description}`);
   }
 
@@ -85,7 +86,7 @@ export function startProfileForTransaction(transaction: Transaction): Transactio
       return null;
     }
     if (processedProfile) {
-      if (__DEBUG_BUILD__) {
+      if (DEBUG_BUILD) {
         logger.log(
           '[Profiling] profile for:',
           transaction.name || transaction.description,
@@ -103,13 +104,13 @@ export function startProfileForTransaction(transaction: Transaction): Transactio
           maxDurationTimeoutID = undefined;
         }
 
-        if (__DEBUG_BUILD__) {
+        if (DEBUG_BUILD) {
           logger.log(`[Profiling] stopped profiling of transaction: ${transaction.name || transaction.description}`);
         }
 
         // In case of an overlapping transaction, stopProfiling may return null and silently ignore the overlapping profile.
         if (!profile) {
-          if (__DEBUG_BUILD__) {
+          if (DEBUG_BUILD) {
             logger.log(
               `[Profiling] profiler returned null profile for: ${transaction.name || transaction.description}`,
               'this may indicate an overlapping transaction or a call to stopProfiling with a profile title that was never started',
@@ -122,7 +123,7 @@ export function startProfileForTransaction(transaction: Transaction): Transactio
         return null;
       })
       .catch(error => {
-        if (__DEBUG_BUILD__) {
+        if (DEBUG_BUILD) {
           logger.log('[Profiling] error while stopping profiler:', error);
         }
         return null;
@@ -131,44 +132,45 @@ export function startProfileForTransaction(transaction: Transaction): Transactio
 
   // Enqueue a timeout to prevent profiles from running over max duration.
   let maxDurationTimeoutID: number | undefined = WINDOW.setTimeout(() => {
-    if (__DEBUG_BUILD__) {
+    if (DEBUG_BUILD) {
       logger.log(
         '[Profiling] max profile duration elapsed, stopping profiling for:',
         transaction.name || transaction.description,
       );
     }
     // If the timeout exceeds, we want to stop profiling, but not finish the transaction
-    void onProfileHandler();
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    onProfileHandler();
   }, MAX_PROFILE_DURATION_MS);
 
-  // We need to reference the original finish call to avoid creating an infinite loop
-  const originalFinish = transaction.finish.bind(transaction);
+  // We need to reference the original end call to avoid creating an infinite loop
+  const originalEnd = transaction.end.bind(transaction);
 
   /**
    * Wraps startTransaction and stopTransaction with profiling related logic.
    * startProfiling is called after the call to startTransaction in order to avoid our own code from
    * being profiled. Because of that same reason, stopProfiling is called before the call to stopTransaction.
    */
-  function profilingWrappedTransactionFinish(): Transaction {
+  function profilingWrappedTransactionEnd(): Transaction {
     if (!transaction) {
-      return originalFinish();
+      return originalEnd();
     }
     // onProfileHandler should always return the same profile even if this is called multiple times.
     // Always call onProfileHandler to ensure stopProfiling is called and the timeout is cleared.
     void onProfileHandler().then(
       () => {
         transaction.setContext('profile', { profile_id: profileId, start_timestamp: startTimestamp });
-        originalFinish();
+        originalEnd();
       },
       () => {
         // If onProfileHandler fails, we still want to call the original finish method.
-        originalFinish();
+        originalEnd();
       },
     );
 
     return transaction;
   }
 
-  transaction.finish = profilingWrappedTransactionFinish;
+  transaction.end = profilingWrappedTransactionEnd;
   return transaction;
 }

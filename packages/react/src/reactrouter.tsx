@@ -105,7 +105,7 @@ function createReactRouterInstrumentation(
       history.listen((location, action) => {
         if (action && (action === 'PUSH' || action === 'POP')) {
           if (activeTransaction) {
-            activeTransaction.finish();
+            activeTransaction.end();
           }
 
           const [name, source] = normalizeTransactionName(location.pathname);
@@ -138,8 +138,8 @@ function matchRoutes(
     const match = route.path
       ? matchPath(pathname, route)
       : branch.length
-      ? branch[branch.length - 1].match // use parent match
-      : computeRootMatch(pathname); // use default "root" match
+        ? branch[branch.length - 1].match // use parent match
+        : computeRootMatch(pathname); // use default "root" match
 
     if (match) {
       branch.push({ route, match });

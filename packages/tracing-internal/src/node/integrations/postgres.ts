@@ -2,6 +2,7 @@ import type { Hub } from '@sentry/core';
 import type { EventProcessor } from '@sentry/types';
 import { fill, isThenable, loadModule, logger } from '@sentry/utils';
 
+import { DEBUG_BUILD } from '../../common/debug-build';
 import type { LazyLoadedIntegration } from './lazy';
 import { shouldDisableAutoInstrumentation } from './utils/node-utils';
 
@@ -76,21 +77,21 @@ export class Postgres implements LazyLoadedIntegration<PGModule> {
    */
   public setupOnce(_: (callback: EventProcessor) => void, getCurrentHub: () => Hub): void {
     if (shouldDisableAutoInstrumentation(getCurrentHub)) {
-      __DEBUG_BUILD__ && logger.log('Postgres Integration is skipped because of instrumenter configuration.');
+      DEBUG_BUILD && logger.log('Postgres Integration is skipped because of instrumenter configuration.');
       return;
     }
 
     const pkg = this.loadDependency();
 
     if (!pkg) {
-      __DEBUG_BUILD__ && logger.error('Postgres Integration was unable to require `pg` package.');
+      DEBUG_BUILD && logger.error('Postgres Integration was unable to require `pg` package.');
       return;
     }
 
     const Client = this._usePgNative ? pkg.native?.Client : pkg.Client;
 
     if (!Client) {
-      __DEBUG_BUILD__ && logger.error("Postgres Integration was unable to access 'pg-native' bindings.");
+      DEBUG_BUILD && logger.error("Postgres Integration was unable to access 'pg-native' bindings.");
       return;
     }
 
@@ -136,14 +137,14 @@ export class Postgres implements LazyLoadedIntegration<PGModule> {
 
         if (typeof callback === 'function') {
           return orig.call(this, config, values, function (err: Error, result: unknown) {
-            span?.finish();
+            span?.end();
             callback(err, result);
           });
         }
 
         if (typeof values === 'function') {
           return orig.call(this, config, function (err: Error, result: unknown) {
-            span?.finish();
+            span?.end();
             values(err, result);
           });
         }
@@ -152,12 +153,12 @@ export class Postgres implements LazyLoadedIntegration<PGModule> {
 
         if (isThenable(rv)) {
           return rv.then((res: unknown) => {
-            span?.finish();
+            span?.end();
             return res;
           });
         }
 
-        span?.finish();
+        span?.end();
         return rv;
       };
     });

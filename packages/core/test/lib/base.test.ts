@@ -1,9 +1,9 @@
 import type { Client, Envelope, Event, Span, Transaction } from '@sentry/types';
-import { dsnToString, logger, SentryError, SyncPromise } from '@sentry/utils';
+import { SentryError, SyncPromise, dsnToString, logger } from '@sentry/utils';
 
-import { Hub, makeSession, Scope } from '../../src';
+import { Hub, Scope, makeSession, setGlobalScope } from '../../src';
 import * as integrationModule from '../../src/integration';
-import { getDefaultTestClientOptions, TestClient } from '../mocks/client';
+import { TestClient, getDefaultTestClientOptions } from '../mocks/client';
 import { AdHocIntegration, TestIntegration } from '../mocks/integration';
 import { makeFakeTransport } from '../mocks/transport';
 
@@ -54,6 +54,7 @@ describe('BaseClient', () => {
   beforeEach(() => {
     TestClient.sendEventCalled = undefined;
     TestClient.instance = undefined;
+    setGlobalScope(undefined);
   });
 
   afterEach(() => {
@@ -756,7 +757,8 @@ describe('BaseClient', () => {
       expect(TestClient.instance!.event!).toEqual(
         expect.objectContaining({
           breadcrumbs: [normalizedBreadcrumb, normalizedBreadcrumb, normalizedBreadcrumb],
-          contexts: normalizedObject,
+          // also has trace context from global scope
+          contexts: { ...normalizedObject, trace: expect.anything() },
           environment: 'production',
           event_id: '42',
           extra: normalizedObject,
@@ -805,7 +807,8 @@ describe('BaseClient', () => {
       expect(TestClient.instance!.event!).toEqual(
         expect.objectContaining({
           breadcrumbs: [normalizedBreadcrumb, normalizedBreadcrumb, normalizedBreadcrumb],
-          contexts: normalizedObject,
+          // also has trace context from global scope
+          contexts: { ...normalizedObject, trace: expect.anything() },
           environment: 'production',
           event_id: '42',
           extra: normalizedObject,
@@ -859,7 +862,8 @@ describe('BaseClient', () => {
       expect(TestClient.instance!.event!).toEqual(
         expect.objectContaining({
           breadcrumbs: [normalizedBreadcrumb, normalizedBreadcrumb, normalizedBreadcrumb],
-          contexts: normalizedObject,
+          // also has trace context from global scope
+          contexts: { ...normalizedObject, trace: expect.anything() },
           environment: 'production',
           event_id: '42',
           extra: normalizedObject,

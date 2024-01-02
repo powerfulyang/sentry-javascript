@@ -1,23 +1,20 @@
-import { getCurrentHub, hasTracingEnabled } from '@sentry/core';
+import { getClient, getCurrentHub, getCurrentScope, hasTracingEnabled, runWithAsyncContext } from '@sentry/core';
 import { flush } from '@sentry/node';
 import type { Transaction } from '@sentry/types';
-import { extractRequestData, isString, logger } from '@sentry/utils';
+import { extractRequestData, fill, isString, logger } from '@sentry/utils';
 import { cwd } from 'process';
 
-import {
-  createRoutes,
-  getTransactionName,
-  instrumentBuild,
-  isRequestHandlerWrapped,
-  startRequestHandlerTransaction,
-} from '../instrumentServer';
+import { DEBUG_BUILD } from '../debug-build';
+import { createRoutes, getTransactionName, instrumentBuild, startRequestHandlerTransaction } from '../instrumentServer';
 import type {
+  AppLoadContext,
   ExpressCreateRequestHandler,
   ExpressCreateRequestHandlerOptions,
   ExpressNextFunction,
   ExpressRequest,
   ExpressRequestHandler,
   ExpressResponse,
+  GetLoadContextFunction,
   ReactRouterDomPkg,
   ServerBuild,
 } from '../vendor/types';
@@ -29,11 +26,6 @@ function wrapExpressRequestHandler(
   build: ServerBuild,
 ): ExpressRequestHandler {
   const routes = createRoutes(build.routes);
-
-  // If the core request handler is already wrapped, don't wrap Express handler which uses it.
-  if (isRequestHandlerWrapped) {
-    return origRequestHandler;
-  }
 
   return async function (
     this: unknown,
@@ -48,38 +40,51 @@ function wrapExpressRequestHandler(
         pkg = await import(`${cwd()}/node_modules/react-router-dom`);
       } finally {
         if (!pkg) {
-          __DEBUG_BUILD__ && logger.error('Could not find `react-router-dom` package.');
+          DEBUG_BUILD && logger.error('Could not find `react-router-dom` package.');
         }
       }
     }
 
-    // eslint-disable-next-line @typescript-eslint/unbound-method
-    res.end = wrapEndMethod(res.end);
+    await runWithAsyncContext(async () => {
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      res.end = wrapEndMethod(res.end);
 
-    const request = extractRequestData(req);
-    const hub = getCurrentHub();
-    const options = hub.getClient()?.getOptions();
-    const scope = hub.getScope();
+      const request = extractRequestData(req);
+      const hub = getCurrentHub();
+      const options = getClient()?.getOptions();
+      const scope = getCurrentScope();
 
-    scope.setSDKProcessingMetadata({ request });
+      scope.setSDKProcessingMetadata({ request });
 
-    if (!options || !hasTracingEnabled(options) || !request.url || !request.method) {
+      if (!options || !hasTracingEnabled(options) || !request.url || !request.method) {
+        return origRequestHandler.call(this, req, res, next);
+      }
+
+      const url = new URL(request.url);
+
+      const [name, source] = getTransactionName(routes, url, pkg);
+      const transaction = startRequestHandlerTransaction(hub, name, source, {
+        headers: {
+          'sentry-trace': (req.headers && isString(req.headers['sentry-trace']) && req.headers['sentry-trace']) || '',
+          baggage: (req.headers && isString(req.headers.baggage) && req.headers.baggage) || '',
+        },
+        method: request.method,
+      });
+      // save a link to the transaction on the response, so that even if there's an error (landing us outside of
+      // the domain), we can still finish it (albeit possibly missing some scope data)
+      (res as AugmentedExpressResponse).__sentryTransaction = transaction;
       return origRequestHandler.call(this, req, res, next);
-    }
-
-    const url = new URL(request.url);
-    const [name, source] = getTransactionName(routes, url, pkg);
-    const transaction = startRequestHandlerTransaction(hub, name, source, {
-      headers: {
-        'sentry-trace': (req.headers && isString(req.headers['sentry-trace']) && req.headers['sentry-trace']) || '',
-        baggage: (req.headers && isString(req.headers.baggage) && req.headers.baggage) || '',
-      },
-      method: request.method,
     });
-    // save a link to the transaction on the response, so that even if there's an error (landing us outside of
-    // the domain), we can still finish it (albeit possibly missing some scope data)
-    (res as AugmentedExpressResponse).__sentryTransaction = transaction;
-    return origRequestHandler.call(this, req, res, next);
+  };
+}
+
+function wrapGetLoadContext(origGetLoadContext: () => AppLoadContext): GetLoadContextFunction {
+  return function (this: unknown, req: ExpressRequest, res: ExpressResponse): AppLoadContext {
+    const loadContext = (origGetLoadContext.call(this, req, res) || {}) as AppLoadContext;
+
+    loadContext['__sentry_express_wrapped__'] = true;
+
+    return loadContext;
   };
 }
 
@@ -91,9 +96,18 @@ export function wrapExpressCreateRequestHandler(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): (options: any) => ExpressRequestHandler {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return function (this: unknown, options: any): ExpressRequestHandler {
-    const newBuild = instrumentBuild((options as ExpressCreateRequestHandlerOptions).build);
-    const requestHandler = origCreateRequestHandler.call(this, { ...options, build: newBuild });
+  return function (this: unknown, options: ExpressCreateRequestHandlerOptions): ExpressRequestHandler {
+    if (!('getLoadContext' in options)) {
+      options['getLoadContext'] = () => ({});
+    }
+
+    fill(options, 'getLoadContext', wrapGetLoadContext);
+
+    const newBuild = instrumentBuild(options.build, true);
+    const requestHandler = origCreateRequestHandler.call(this, {
+      ...options,
+      build: newBuild,
+    });
 
     return wrapExpressRequestHandler(requestHandler, newBuild);
   };
@@ -142,7 +156,7 @@ async function finishSentryProcessing(res: AugmentedExpressResponse): Promise<vo
     // transaction closes, and make sure to wait until that's done before flushing events
     await new Promise<void>(resolve => {
       setImmediate(() => {
-        transaction.finish();
+        transaction.end();
         resolve();
       });
     });
@@ -151,10 +165,10 @@ async function finishSentryProcessing(res: AugmentedExpressResponse): Promise<vo
   // Flush the event queue to ensure that events get sent to Sentry before the response is finished and the lambda
   // ends. If there was an error, rethrow it so that the normal exception-handling mechanisms can apply.
   try {
-    __DEBUG_BUILD__ && logger.log('Flushing events...');
+    DEBUG_BUILD && logger.log('Flushing events...');
     await flush(2000);
-    __DEBUG_BUILD__ && logger.log('Done flushing events');
+    DEBUG_BUILD && logger.log('Done flushing events');
   } catch (e) {
-    __DEBUG_BUILD__ && logger.log('Error while flushing events:\n', e);
+    DEBUG_BUILD && logger.log('Error while flushing events:\n', e);
   }
 }

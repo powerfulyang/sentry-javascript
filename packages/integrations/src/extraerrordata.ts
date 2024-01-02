@@ -1,67 +1,55 @@
-import type { Contexts, Event, EventHint, ExtendedError, Integration } from '@sentry/types';
+import { convertIntegrationFnToClass } from '@sentry/core';
+import type { Contexts, Event, EventHint, ExtendedError, IntegrationFn } from '@sentry/types';
 import { addNonEnumerableProperty, isError, isPlainObject, logger, normalize } from '@sentry/utils';
 
-/** JSDoc */
+import { DEBUG_BUILD } from './debug-build';
+
+const INTEGRATION_NAME = 'ExtraErrorData';
+
 interface ExtraErrorDataOptions {
+  /**
+   * The object depth up to which to capture data on error objects.
+   */
   depth: number;
-}
-
-/** Patch toString calls to return proper name for wrapped functions */
-export class ExtraErrorData implements Integration {
-  /**
-   * @inheritDoc
-   */
-  public static id: string = 'ExtraErrorData';
 
   /**
-   * @inheritDoc
-   */
-  public name: string;
-
-  /** JSDoc */
-  private readonly _options: ExtraErrorDataOptions;
-
-  /**
-   * @inheritDoc
-   */
-  public constructor(options?: Partial<ExtraErrorDataOptions>) {
-    this.name = ExtraErrorData.id;
-
-    this._options = {
-      depth: 3,
-      ...options,
-    };
-  }
-
-  /**
-   * @inheritDoc
-   */
-  public setupOnce(_addGlobaleventProcessor: unknown, _getCurrentHub: unknown): void {
-    // noop
-  }
-
-  /** @inheritDoc */
-  public processEvent(event: Event, hint: EventHint): Event {
-    return this.enhanceEventWithErrorData(event, hint);
-  }
-
-  /**
-   * Attaches extracted information from the Error object to extra field in the Event.
+   * Whether to capture error causes.
    *
-   * TODO (v8): Drop this public function.
+   * More information: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error/cause
    */
-  public enhanceEventWithErrorData(event: Event, hint: EventHint = {}): Event {
-    return _enhanceEventWithErrorData(event, hint, this._options.depth);
-  }
+  captureErrorCause: boolean;
 }
 
-function _enhanceEventWithErrorData(event: Event, hint: EventHint = {}, depth: number): Event {
+const extraErrorDataIntegration = ((options: Partial<ExtraErrorDataOptions> = {}) => {
+  const depth = options.depth || 3;
+
+  // TODO(v8): Flip the default for this option to true
+  const captureErrorCause = options.captureErrorCause || false;
+
+  return {
+    name: INTEGRATION_NAME,
+    processEvent(event, hint) {
+      return _enhanceEventWithErrorData(event, hint, depth, captureErrorCause);
+    },
+  };
+}) satisfies IntegrationFn;
+
+/** Extract additional data for from original exceptions. */
+// eslint-disable-next-line deprecation/deprecation
+export const ExtraErrorData = convertIntegrationFnToClass(INTEGRATION_NAME, extraErrorDataIntegration);
+
+function _enhanceEventWithErrorData(
+  event: Event,
+  hint: EventHint = {},
+  depth: number,
+  captureErrorCause: boolean,
+): Event {
   if (!hint.originalException || !isError(hint.originalException)) {
     return event;
   }
   const exceptionName = (hint.originalException as ExtendedError).name || hint.originalException.constructor.name;
 
-  const errorData = _extractErrorData(hint.originalException as ExtendedError);
+  const errorData = _extractErrorData(hint.originalException as ExtendedError, captureErrorCause);
 
   if (errorData) {
     const contexts: Contexts = {
@@ -89,7 +77,7 @@ function _enhanceEventWithErrorData(event: Event, hint: EventHint = {}, depth: n
 /**
  * Extract extra information from the Error object
  */
-function _extractErrorData(error: ExtendedError): Record<string, unknown> | null {
+function _extractErrorData(error: ExtendedError, captureErrorCause: boolean): Record<string, unknown> | null {
   // We are trying to enhance already existing event, so no harm done if it won't succeed
   try {
     const nativeKeys = [
@@ -115,6 +103,12 @@ function _extractErrorData(error: ExtendedError): Record<string, unknown> | null
       extraErrorInfo[key] = isError(value) ? value.toString() : value;
     }
 
+    // Error.cause is a standard property that is non enumerable, we therefore need to access it separately.
+    // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error/cause
+    if (captureErrorCause && error.cause !== undefined) {
+      extraErrorInfo.cause = isError(error.cause) ? error.cause.toString() : error.cause;
+    }
+
     // Check if someone attached `toJSON` method to grab even more properties (eg. axios is doing that)
     if (typeof error.toJSON === 'function') {
       const serializedError = error.toJSON() as Record<string, unknown>;
@@ -127,7 +121,7 @@ function _extractErrorData(error: ExtendedError): Record<string, unknown> | null
 
     return extraErrorInfo;
   } catch (oO) {
-    __DEBUG_BUILD__ && logger.error('Unable to extract extra data from the Error object:', oO);
+    DEBUG_BUILD && logger.error('Unable to extract extra data from the Error object:', oO);
   }
 
   return null;

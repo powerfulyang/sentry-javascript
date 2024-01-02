@@ -1,19 +1,29 @@
-/* eslint-disable max-lines */
-import type { Scope } from '@sentry/node';
-import * as Sentry from '@sentry/node';
-import { captureException, captureMessage, flush, getCurrentHub, withScope } from '@sentry/node';
-import type { Integration, SdkMetadata } from '@sentry/types';
-import { isString, logger, tracingContextFromHeaders } from '@sentry/utils';
-// NOTE: I have no idea how to fix this right now, and don't want to waste more time, as it builds just fine — Kamil
-// eslint-disable-next-line import/no-unresolved
-import type { Context, Handler } from 'aws-lambda';
 import { existsSync } from 'fs';
 import { hostname } from 'os';
 import { basename, resolve } from 'path';
-import { performance } from 'perf_hooks';
 import { types } from 'util';
+/* eslint-disable max-lines */
+import type { NodeOptions, Scope } from '@sentry/node';
+import { SDK_VERSION } from '@sentry/node';
+import {
+  captureException,
+  captureMessage,
+  continueTrace,
+  defaultIntegrations as nodeDefaultIntegrations,
+  flush,
+  getCurrentScope,
+  init as initNode,
+  startSpanManual,
+  withScope,
+} from '@sentry/node';
+import type { Integration, SdkMetadata, Span } from '@sentry/types';
+import { isString, logger } from '@sentry/utils';
+// NOTE: I have no idea how to fix this right now, and don't want to waste more time, as it builds just fine — Kamil
+import type { Context, Handler } from 'aws-lambda';
+import { performance } from 'perf_hooks';
 
 import { AWSServices } from './awsservices';
+import { DEBUG_BUILD } from './debug-build';
 import { markEventUnhandled } from './utils';
 
 export * from '@sentry/node';
@@ -55,9 +65,9 @@ export interface WrapperOptions {
   startTrace: boolean;
 }
 
-export const defaultIntegrations: Integration[] = [...Sentry.defaultIntegrations, new AWSServices({ optional: true })];
+export const defaultIntegrations: Integration[] = [...nodeDefaultIntegrations, new AWSServices({ optional: true })];
 
-interface AWSLambdaOptions extends Sentry.NodeOptions {
+interface AWSLambdaOptions extends NodeOptions {
   /**
    * Internal field that is set to `true` when init() is called by the Sentry AWS Lambda layer.
    *
@@ -66,7 +76,9 @@ interface AWSLambdaOptions extends Sentry.NodeOptions {
 }
 
 /**
- * @see {@link Sentry.init}
+ * Initializes the Sentry AWS Lambda SDK.
+ *
+ * @param options Configuration options for the SDK, @see {@link AWSLambdaOptions}.
  */
 export function init(options: AWSLambdaOptions = {}): void {
   const opts = {
@@ -81,13 +93,13 @@ export function init(options: AWSLambdaOptions = {}): void {
     packages: [
       {
         name: 'npm:@sentry/serverless',
-        version: Sentry.SDK_VERSION,
+        version: SDK_VERSION,
       },
     ],
-    version: Sentry.SDK_VERSION,
+    version: SDK_VERSION,
   };
 
-  Sentry.init(opts);
+  initNode(opts);
 }
 
 /** */
@@ -131,7 +143,7 @@ export function tryPatchHandler(taskRoot: string, handlerPath: string): void {
   const handlerDesc = basename(handlerPath);
   const match = handlerDesc.match(/^([^.]*)\.(.*)$/);
   if (!match) {
-    __DEBUG_BUILD__ && logger.error(`Bad handler ${handlerDesc}`);
+    DEBUG_BUILD && logger.error(`Bad handler ${handlerDesc}`);
     return;
   }
 
@@ -142,7 +154,7 @@ export function tryPatchHandler(taskRoot: string, handlerPath: string): void {
     const handlerDir = handlerPath.substring(0, handlerPath.indexOf(handlerDesc));
     obj = tryRequire(taskRoot, handlerDir, handlerMod);
   } catch (e) {
-    __DEBUG_BUILD__ && logger.error(`Cannot require ${handlerPath} in ${taskRoot}`, e);
+    DEBUG_BUILD && logger.error(`Cannot require ${handlerPath} in ${taskRoot}`, e);
     return;
   }
 
@@ -154,11 +166,11 @@ export function tryPatchHandler(taskRoot: string, handlerPath: string): void {
     functionName = name;
   });
   if (!obj) {
-    __DEBUG_BUILD__ && logger.error(`${handlerPath} is undefined or not exported`);
+    DEBUG_BUILD && logger.error(`${handlerPath} is undefined or not exported`);
     return;
   }
   if (typeof obj !== 'function') {
-    __DEBUG_BUILD__ && logger.error(`${handlerPath} is not a function`);
+    DEBUG_BUILD && logger.error(`${handlerPath} is not a function`);
     return;
   }
 
@@ -290,9 +302,35 @@ export function wrapHandler<TEvent, TResult>(
       }, timeoutWarningDelay) as unknown as NodeJS.Timeout;
     }
 
-    const hub = getCurrentHub();
+    async function processResult(span?: Span): Promise<TResult> {
+      const scope = getCurrentScope();
 
-    let transaction: Sentry.Transaction | undefined;
+      let rv: TResult;
+      try {
+        enhanceScopeWithEnvironmentData(scope, context, START_TIME);
+
+        rv = await asyncHandler(event, context);
+
+        // We manage lambdas that use Promise.allSettled by capturing the errors of failed promises
+        if (options.captureAllSettledReasons && Array.isArray(rv) && isPromiseAllSettledResult(rv)) {
+          const reasons = getRejectedReasons(rv);
+          reasons.forEach(exception => {
+            captureException(exception, scope => markEventUnhandled(scope));
+          });
+        }
+      } catch (e) {
+        captureException(e, scope => markEventUnhandled(scope));
+        throw e;
+      } finally {
+        clearTimeout(timeoutWarningTimer);
+        span?.end();
+        await flush(options.flushTimeout).catch(e => {
+          DEBUG_BUILD && logger.error(e);
+        });
+      }
+      return rv;
+    }
+
     if (options.startTrace) {
       const eventWithHeaders = event as { headers?: { [key: string]: string } };
 
@@ -301,53 +339,30 @@ export function wrapHandler<TEvent, TResult>(
           ? eventWithHeaders.headers['sentry-trace']
           : undefined;
       const baggage = eventWithHeaders.headers?.baggage;
-      const { traceparentData, dynamicSamplingContext, propagationContext } = tracingContextFromHeaders(
-        sentryTrace,
-        baggage,
-      );
-      hub.getScope().setPropagationContext(propagationContext);
 
-      transaction = hub.startTransaction({
-        name: context.functionName,
-        op: 'function.aws.lambda',
-        origin: 'auto.function.serverless',
-        ...traceparentData,
-        metadata: {
-          dynamicSamplingContext: traceparentData && !dynamicSamplingContext ? {} : dynamicSamplingContext,
-          source: 'component',
+      const continueTraceContext = continueTrace({ sentryTrace, baggage });
+
+      return startSpanManual(
+        {
+          name: context.functionName,
+          op: 'function.aws.lambda',
+          origin: 'auto.function.serverless',
+          ...continueTraceContext,
+          metadata: {
+            ...continueTraceContext.metadata,
+            source: 'component',
+          },
         },
-      });
+        span => {
+          enhanceScopeWithTransactionData(getCurrentScope(), context);
+
+          return processResult(span);
+        },
+      );
     }
 
-    const scope = hub.pushScope();
-    let rv: TResult;
-    try {
-      enhanceScopeWithEnvironmentData(scope, context, START_TIME);
-      if (options.startTrace) {
-        enhanceScopeWithTransactionData(scope, context);
-        // We put the transaction on the scope so users can attach children to it
-        scope.setSpan(transaction);
-      }
-      rv = await asyncHandler(event, context);
-
-      // We manage lambdas that use Promise.allSettled by capturing the errors of failed promises
-      if (options.captureAllSettledReasons && Array.isArray(rv) && isPromiseAllSettledResult(rv)) {
-        const reasons = getRejectedReasons(rv);
-        reasons.forEach(exception => {
-          captureException(exception, scope => markEventUnhandled(scope));
-        });
-      }
-    } catch (e) {
-      captureException(e, scope => markEventUnhandled(scope));
-      throw e;
-    } finally {
-      clearTimeout(timeoutWarningTimer);
-      transaction?.finish();
-      hub.popScope();
-      await flush(options.flushTimeout).catch(e => {
-        __DEBUG_BUILD__ && logger.error(e);
-      });
-    }
-    return rv;
+    return withScope(async () => {
+      return processResult(undefined);
+    });
   };
 }

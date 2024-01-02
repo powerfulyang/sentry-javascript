@@ -1,8 +1,7 @@
 /* eslint-disable deprecation/deprecation */
-import { Hub, makeMain, TRACING_DEFAULTS } from '@sentry/core';
+import { Hub, TRACING_DEFAULTS, makeMain } from '@sentry/core';
 import * as hubExtensions from '@sentry/core';
-import type { BaseTransportOptions, ClientOptions, DsnComponents } from '@sentry/types';
-import type { InstrumentHandlerCallback, InstrumentHandlerType } from '@sentry/utils';
+import type { BaseTransportOptions, ClientOptions, DsnComponents, HandlerDataHistory } from '@sentry/types';
 import { JSDOM } from 'jsdom';
 
 import type { IdleTransaction } from '../../../tracing/src';
@@ -15,17 +14,15 @@ import { instrumentRoutingWithDefaults } from '../../src/browser/router';
 import { WINDOW } from '../../src/browser/types';
 import { TestClient } from '../utils/TestClient';
 
-let mockChangeHistory: ({ to, from }: { to: string; from?: string }) => void = () => undefined;
+let mockChangeHistory: (data: HandlerDataHistory) => void = () => {};
 
 jest.mock('@sentry/utils', () => {
   const actual = jest.requireActual('@sentry/utils');
   return {
     ...actual,
-    addInstrumentationHandler: (type: InstrumentHandlerType, callback: InstrumentHandlerCallback): void => {
-      if (type === 'history') {
-        // rather than actually add the navigation-change handler, grab a reference to it, so we can trigger it manually
-        mockChangeHistory = callback;
-      }
+
+    addHistoryInstrumentationHandler: (callback: (data: HandlerDataHistory) => void): void => {
+      mockChangeHistory = callback;
     },
   };
 });
@@ -73,7 +70,7 @@ conditionalTest({ min: 10 })('BrowserTracing', () => {
     const activeTransaction = getActiveTransaction();
     if (activeTransaction) {
       // Should unset off of scope.
-      activeTransaction.finish();
+      activeTransaction.end();
     }
   });
 
@@ -181,10 +178,10 @@ conditionalTest({ min: 10 })('BrowserTracing', () => {
 
       const transaction = getActiveTransaction(hub) as IdleTransaction;
       const span = transaction.startChild();
-      span.finish();
+      span.end();
 
       if (span.endTimestamp) {
-        transaction.finish(span.endTimestamp + 12345);
+        transaction.end(span.endTimestamp + 12345);
       }
       expect(transaction.endTimestamp).toBe(span.endTimestamp);
     });
@@ -421,10 +418,10 @@ conditionalTest({ min: 10 })('BrowserTracing', () => {
         createBrowserTracing(true, { routingInstrumentation: customInstrumentRouting });
         const mockFinish = jest.fn();
         const transaction = getActiveTransaction(hub) as IdleTransaction;
-        transaction.finish = mockFinish;
+        transaction.end = mockFinish;
 
         const span = transaction.startChild(); // activities = 1
-        span.finish(); // activities = 0
+        span.end(); // activities = 0
 
         expect(mockFinish).toHaveBeenCalledTimes(0);
         jest.advanceTimersByTime(TRACING_DEFAULTS.idleTimeout);
@@ -435,10 +432,10 @@ conditionalTest({ min: 10 })('BrowserTracing', () => {
         createBrowserTracing(true, { idleTimeout: 2000, routingInstrumentation: customInstrumentRouting });
         const mockFinish = jest.fn();
         const transaction = getActiveTransaction(hub) as IdleTransaction;
-        transaction.finish = mockFinish;
+        transaction.end = mockFinish;
 
         const span = transaction.startChild(); // activities = 1
-        span.finish(); // activities = 0
+        span.end(); // activities = 0
 
         expect(mockFinish).toHaveBeenCalledTimes(0);
         jest.advanceTimersByTime(2000);
@@ -450,7 +447,7 @@ conditionalTest({ min: 10 })('BrowserTracing', () => {
         const transaction = getActiveTransaction(hub) as IdleTransaction;
 
         const span = transaction.startChild(); // activities = 1
-        span.finish(); // activities = 0
+        span.end(); // activities = 0
 
         jest.advanceTimersByTime(TRACING_DEFAULTS.idleTimeout);
         expect(mockStartTrackingWebVitals).toHaveBeenCalledTimes(1);
@@ -463,10 +460,10 @@ conditionalTest({ min: 10 })('BrowserTracing', () => {
         createBrowserTracing(true, { heartbeatInterval: interval, routingInstrumentation: customInstrumentRouting });
         const mockFinish = jest.fn();
         const transaction = getActiveTransaction(hub) as IdleTransaction;
-        transaction.finish = mockFinish;
+        transaction.end = mockFinish;
 
         const span = transaction.startChild(); // activities = 1
-        span.finish(); // activities = 0
+        span.end(); // activities = 0
 
         expect(mockFinish).toHaveBeenCalledTimes(0);
         jest.advanceTimersByTime(interval * 3);

@@ -1,11 +1,12 @@
 /* eslint-disable max-lines */ // TODO: We might want to split this file up
 import { EventType, record } from '@sentry-internal/rrweb';
-import { captureException, getCurrentHub } from '@sentry/core';
+import { captureException, getClient, getCurrentScope } from '@sentry/core';
 import type { ReplayRecordingMode, Transaction } from '@sentry/types';
 import { logger } from '@sentry/utils';
 
 import {
   BUFFER_CHECKOUT_TIME,
+  CANVAS_QUALITY,
   SESSION_IDLE_EXPIRE_DURATION,
   SESSION_IDLE_PAUSE_DURATION,
   SLOW_CLICK_SCROLL_TIMEOUT,
@@ -15,6 +16,7 @@ import {
 import { ClickDetector } from './coreHandlers/handleClick';
 import { handleKeyboardEvent } from './coreHandlers/handleKeyboardEvent';
 import { setupPerformanceObserver } from './coreHandlers/performanceObserver';
+import { DEBUG_BUILD } from './debug-build';
 import { createEventBuffer } from './eventBuffer';
 import { clearSession } from './session/clearSession';
 import { loadOrCreateSession } from './session/loadOrCreateSession';
@@ -53,7 +55,7 @@ import { isSessionExpired } from './util/isSessionExpired';
 import { logInfo, logInfoNextTick } from './util/log';
 import { sendReplay } from './util/sendReplay';
 import type { SKIPPED } from './util/throttle';
-import { throttle, THROTTLED } from './util/throttle';
+import { THROTTLED, throttle } from './util/throttle';
 
 /**
  * The main replay container class, which holds all the state and methods for recording and sending replays.
@@ -330,6 +332,7 @@ export class ReplayContainer implements ReplayContainerInterface {
    */
   public startRecording(): void {
     try {
+      const canvas = this._options._experiments.canvas;
       this._stopRecording = record({
         ...this._recordingOptions,
         // When running in error sampling mode, we need to overwrite `checkoutEveryNms`
@@ -338,6 +341,12 @@ export class ReplayContainer implements ReplayContainerInterface {
         ...(this.recordingMode === 'buffer' && { checkoutEveryNms: BUFFER_CHECKOUT_TIME }),
         emit: getHandleRecordingEmit(this),
         onMutation: this._onMutationHandler,
+        ...(canvas &&
+          canvas.manager && {
+            recordCanvas: true,
+            getCanvasManager: canvas.manager,
+            ...(CANVAS_QUALITY[canvas.quality || 'medium'] || CANVAS_QUALITY.medium),
+          }),
       });
     } catch (err) {
       this._handleException(err);
@@ -690,7 +699,7 @@ export class ReplayContainer implements ReplayContainerInterface {
    * This is only available if performance is enabled, and if an instrumented router is used.
    */
   public getCurrentRoute(): string | undefined {
-    const lastTransaction = this.lastTransaction || getCurrentHub().getScope().getTransaction();
+    const lastTransaction = this.lastTransaction || getCurrentScope().getTransaction();
     if (!lastTransaction || !['route', 'custom'].includes(lastTransaction.metadata.source)) {
       return undefined;
     }
@@ -726,9 +735,9 @@ export class ReplayContainer implements ReplayContainerInterface {
 
   /** A wrapper to conditionally capture exceptions. */
   private _handleException(error: unknown): void {
-    __DEBUG_BUILD__ && logger.error('[Replay]', error);
+    DEBUG_BUILD && logger.error('[Replay]', error);
 
-    if (__DEBUG_BUILD__ && this._options._experiments && this._options._experiments.captureExceptions) {
+    if (DEBUG_BUILD && this._options._experiments && this._options._experiments.captureExceptions) {
       captureException(error);
     }
   }
@@ -777,7 +786,9 @@ export class ReplayContainer implements ReplayContainerInterface {
         maxReplayDuration: this._options.maxReplayDuration,
       })
     ) {
-      void this._refreshSession(currentSession);
+      // This should never reject
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      this._refreshSession(currentSession);
       return false;
     }
 
@@ -916,6 +927,8 @@ export class ReplayContainer implements ReplayContainerInterface {
     // Send replay when the page/tab becomes hidden. There is no reason to send
     // replay if it becomes visible, since no actions we care about were done
     // while it was hidden
+    // This should never reject
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
     void this.conditionalFlush();
   }
 
@@ -964,7 +977,9 @@ export class ReplayContainer implements ReplayContainerInterface {
    */
   private _createCustomBreadcrumb(breadcrumb: ReplayBreadcrumbFrame): void {
     this.addUpdate(() => {
-      void this.throttledAddEvent({
+      // This should never reject
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      this.throttledAddEvent({
         type: EventType.Custom,
         timestamp: breadcrumb.timestamp || 0,
         data: {
@@ -1045,7 +1060,7 @@ export class ReplayContainer implements ReplayContainerInterface {
     const replayId = this.getSessionId();
 
     if (!this.session || !this.eventBuffer || !replayId) {
-      __DEBUG_BUILD__ && logger.error('[Replay] No session or eventBuffer found to flush.');
+      DEBUG_BUILD && logger.error('[Replay] No session or eventBuffer found to flush.');
       return;
     }
 
@@ -1105,9 +1120,11 @@ export class ReplayContainer implements ReplayContainerInterface {
       // This means we retried 3 times and all of them failed,
       // or we ran into a problem we don't want to retry, like rate limiting.
       // In this case, we want to completely stop the replay - otherwise, we may get inconsistent segments
-      void this.stop({ reason: 'sendReplay' });
+      // This should never reject
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      this.stop({ reason: 'sendReplay' });
 
-      const client = getCurrentHub().getClient();
+      const client = getClient();
 
       if (client) {
         client.recordDroppedEvent('send_error', 'replay');
@@ -1135,7 +1152,7 @@ export class ReplayContainer implements ReplayContainerInterface {
     }
 
     if (!this.checkAndHandleExpiredSession()) {
-      __DEBUG_BUILD__ && logger.error('[Replay] Attempting to finish replay event after session expired.');
+      DEBUG_BUILD && logger.error('[Replay] Attempting to finish replay event after session expired.');
       return;
     }
 
@@ -1193,7 +1210,7 @@ export class ReplayContainer implements ReplayContainerInterface {
     try {
       await this._flushLock;
     } catch (err) {
-      __DEBUG_BUILD__ && logger.error(err);
+      DEBUG_BUILD && logger.error(err);
     } finally {
       this._debouncedFlush();
     }
@@ -1229,7 +1246,9 @@ export class ReplayContainer implements ReplayContainerInterface {
 
     // Stop replay if over the mutation limit
     if (overMutationLimit) {
-      void this.stop({ reason: 'mutationLimit', forceFlush: this.recordingMode === 'session' });
+      // This should never reject
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      this.stop({ reason: 'mutationLimit', forceFlush: this.recordingMode === 'session' });
       return false;
     }
 

@@ -1,8 +1,9 @@
+import type { ServerResponse } from 'http';
 import { flush } from '@sentry/core';
 import type { Transaction } from '@sentry/types';
 import { fill, logger } from '@sentry/utils';
-import type { ServerResponse } from 'http';
 
+import { DEBUG_BUILD } from '../debug-build';
 import type { ResponseEndMethod, WrappedResponseEndMethod } from '../types';
 
 /**
@@ -25,7 +26,7 @@ import type { ResponseEndMethod, WrappedResponseEndMethod } from '../types';
 export function autoEndTransactionOnResponseEnd(transaction: Transaction, res: ServerResponse): void {
   const wrapEndMethod = (origEnd: ResponseEndMethod): WrappedResponseEndMethod => {
     return function sentryWrappedEnd(this: ServerResponse, ...args: unknown[]) {
-      void finishTransaction(transaction, this);
+      finishTransaction(transaction, this);
       return origEnd.call(this, ...args);
     };
   };
@@ -38,20 +39,20 @@ export function autoEndTransactionOnResponseEnd(transaction: Transaction, res: S
 }
 
 /** Finish the given response's transaction and set HTTP status data */
-export async function finishTransaction(transaction: Transaction | undefined, res: ServerResponse): Promise<void> {
+export function finishTransaction(transaction: Transaction | undefined, res: ServerResponse): void {
   if (transaction) {
     transaction.setHttpStatus(res.statusCode);
-    transaction.finish();
+    transaction.end();
   }
 }
 
 /** Flush the event queue to ensure that events get sent to Sentry before the response is finished and the lambda ends */
 export async function flushQueue(): Promise<void> {
   try {
-    __DEBUG_BUILD__ && logger.log('Flushing events...');
+    DEBUG_BUILD && logger.log('Flushing events...');
     await flush(2000);
-    __DEBUG_BUILD__ && logger.log('Done flushing events');
+    DEBUG_BUILD && logger.log('Done flushing events');
   } catch (e) {
-    __DEBUG_BUILD__ && logger.log('Error while flushing events:\n', e);
+    DEBUG_BUILD && logger.log('Error while flushing events:\n', e);
   }
 }

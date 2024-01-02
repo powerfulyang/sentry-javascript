@@ -13,8 +13,11 @@ import type {
   EventDropReason,
   EventHint,
   EventProcessor,
+  FeedbackEvent,
   Integration,
   IntegrationClass,
+  MetricBucketItem,
+  MetricsAggregator,
   Outcome,
   PropagationContext,
   SdkMetadata,
@@ -27,8 +30,9 @@ import type {
   Transport,
   TransportMakeRequestResponse,
 } from '@sentry/types';
-import type { FeedbackEvent } from '@sentry/types';
 import {
+  SentryError,
+  SyncPromise,
   addItemToEnvelope,
   checkOrSetAlreadyCaught,
   createAttachmentEnvelopeItem,
@@ -39,14 +43,16 @@ import {
   makeDsn,
   rejectedSyncPromise,
   resolvedSyncPromise,
-  SentryError,
-  SyncPromise,
 } from '@sentry/utils';
 
 import { getEnvelopeEndpointWithUrlEncodedAuth } from './api';
+import { DEBUG_BUILD } from './debug-build';
 import { createEventEnvelope, createSessionEnvelope } from './envelope';
+import { getClient } from './exports';
+import { getIsolationScope } from './hub';
 import type { IntegrationIndex } from './integration';
 import { setupIntegration, setupIntegrations } from './integration';
+import { createMetricEnvelope } from './metrics/envelope';
 import type { Scope } from './scope';
 import { updateSession } from './session';
 import { getDynamicSamplingContextFromClient } from './tracing/dynamicSamplingContext';
@@ -86,6 +92,13 @@ const ALREADY_SEEN_ERROR = "Not capturing exception because it's already been ca
  * }
  */
 export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
+  /**
+   * A reference to a metrics aggregator
+   *
+   * @experimental Note this is alpha API. It may experience breaking changes in the future.
+   */
+  public metricsAggregator?: MetricsAggregator;
+
   /** Options passed to the SDK. */
   protected readonly _options: O;
 
@@ -103,13 +116,13 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
   /** Number of calls being processed */
   protected _numProcessing: number;
 
+  protected _eventProcessors: EventProcessor[];
+
   /** Holds flushable  */
   private _outcomes: { [key: string]: number };
 
   // eslint-disable-next-line @typescript-eslint/ban-types
   private _hooks: Record<string, Function[]>;
-
-  private _eventProcessors: EventProcessor[];
 
   /**
    * Initializes this client instance.
@@ -128,7 +141,7 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
     if (options.dsn) {
       this._dsn = makeDsn(options.dsn);
     } else {
-      __DEBUG_BUILD__ && logger.warn('No DSN provided, client will not send events.');
+      DEBUG_BUILD && logger.warn('No DSN provided, client will not send events.');
     }
 
     if (this._dsn) {
@@ -148,7 +161,7 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
   public captureException(exception: any, hint?: EventHint, scope?: Scope): string | undefined {
     // ensure we haven't captured this very object before
     if (checkOrSetAlreadyCaught(exception)) {
-      __DEBUG_BUILD__ && logger.log(ALREADY_SEEN_ERROR);
+      DEBUG_BUILD && logger.log(ALREADY_SEEN_ERROR);
       return;
     }
 
@@ -198,7 +211,7 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
   public captureEvent(event: Event, hint?: EventHint, scope?: Scope): string | undefined {
     // ensure we haven't captured this very object before
     if (hint && hint.originalException && checkOrSetAlreadyCaught(hint.originalException)) {
-      __DEBUG_BUILD__ && logger.log(ALREADY_SEEN_ERROR);
+      DEBUG_BUILD && logger.log(ALREADY_SEEN_ERROR);
       return;
     }
 
@@ -218,7 +231,7 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
    */
   public captureSession(session: Session): void {
     if (!(typeof session.release === 'string')) {
-      __DEBUG_BUILD__ && logger.warn('Discarded session because of missing or non-string release');
+      DEBUG_BUILD && logger.warn('Discarded session because of missing or non-string release');
     } else {
       this.sendSession(session);
       // After sending, we set init false to indicate it's not the first occurrence
@@ -262,6 +275,9 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
   public flush(timeout?: number): PromiseLike<boolean> {
     const transport = this._transport;
     if (transport) {
+      if (this.metricsAggregator) {
+        this.metricsAggregator.flush();
+      }
       return this._isClientDoneProcessing(timeout).then(clientFinished => {
         return transport.flush(timeout).then(transportFlushed => clientFinished && transportFlushed);
       });
@@ -276,6 +292,9 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
   public close(timeout?: number): PromiseLike<boolean> {
     return this.flush(timeout).then(result => {
       this.getOptions().enabled = false;
+      if (this.metricsAggregator) {
+        this.metricsAggregator.close();
+      }
       return result;
     });
   }
@@ -316,7 +335,7 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
     try {
       return (this._integrations[integration.id] as T) || null;
     } catch (_oO) {
-      __DEBUG_BUILD__ && logger.warn(`Cannot retrieve integration ${integration.id} from the current Client`);
+      DEBUG_BUILD && logger.warn(`Cannot retrieve integration ${integration.id} from the current Client`);
       return null;
     }
   }
@@ -357,7 +376,10 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
    */
   public sendSession(session: Session | SessionAggregates): void {
     const env = createSessionEnvelope(session, this._dsn, this._options._metadata, this._options.tunnel);
-    void this._sendEnvelope(env);
+
+    // _sendEnvelope should not throw
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    this._sendEnvelope(env);
   }
 
   /**
@@ -374,11 +396,28 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
       // would be `Partial<Record<SentryRequestType, Partial<Record<Outcome, number>>>>`
       // With typescript 4.1 we could even use template literal types
       const key = `${reason}:${category}`;
-      __DEBUG_BUILD__ && logger.log(`Adding outcome: "${key}"`);
+      DEBUG_BUILD && logger.log(`Adding outcome: "${key}"`);
 
       // The following works because undefined + 1 === NaN and NaN is falsy
       this._outcomes[key] = this._outcomes[key] + 1 || 1;
     }
+  }
+
+  /**
+   * @inheritDoc
+   */
+  public captureAggregateMetrics(metricBucketItems: Array<MetricBucketItem>): void {
+    DEBUG_BUILD && logger.log(`Flushing aggregated metrics, number of metrics: ${metricBucketItems.length}`);
+    const metricsEnvelope = createMetricEnvelope(
+      metricBucketItems,
+      this._dsn,
+      this._options._metadata,
+      this._options.tunnel,
+    );
+
+    // _sendEnvelope should not throw
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    this._sendEnvelope(metricsEnvelope);
   }
 
   // Keep on() & emit() signatures in sync with types' client.ts interface
@@ -551,7 +590,12 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
    * @param scope A scope containing event metadata.
    * @returns A new event with more information.
    */
-  protected _prepareEvent(event: Event, hint: EventHint, scope?: Scope): PromiseLike<Event | null> {
+  protected _prepareEvent(
+    event: Event,
+    hint: EventHint,
+    scope?: Scope,
+    isolationScope = getIsolationScope(),
+  ): PromiseLike<Event | null> {
     const options = this.getOptions();
     const integrations = Object.keys(this._integrations);
     if (!hint.integrations && integrations.length > 0) {
@@ -560,7 +604,7 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
 
     this.emit('preprocessEvent', event, hint);
 
-    return prepareEvent(options, event, hint, scope, this).then(evt => {
+    return prepareEvent(options, event, hint, scope, this, isolationScope).then(evt => {
       if (evt === null) {
         return evt;
       }
@@ -604,7 +648,7 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
         return finalEvent.event_id;
       },
       reason => {
-        if (__DEBUG_BUILD__) {
+        if (DEBUG_BUILD) {
           // If something's gone wrong, log the error as a warning. If it's just us having used a `SentryError` for
           // control flow, log just the message (no stack) as a log-level log.
           const sentryError = reason as SentryError;
@@ -739,10 +783,10 @@ export abstract class BaseClient<O extends ClientOptions> implements Client<O> {
 
     if (this._isEnabled() && this._transport) {
       return this._transport.send(envelope).then(null, reason => {
-        __DEBUG_BUILD__ && logger.error('Error while sending event:', reason);
+        DEBUG_BUILD && logger.error('Error while sending event:', reason);
       });
     } else {
-      __DEBUG_BUILD__ && logger.error('Transport disabled');
+      DEBUG_BUILD && logger.error('Transport disabled');
     }
   }
 
@@ -832,4 +876,18 @@ function isErrorEvent(event: Event): event is ErrorEvent {
 
 function isTransactionEvent(event: Event): event is TransactionEvent {
   return event.type === 'transaction';
+}
+
+/**
+ * Add an event processor to the current client.
+ * This event processor will run for all events processed by this client.
+ */
+export function addEventProcessor(callback: EventProcessor): void {
+  const client = getClient();
+
+  if (!client || !client.addEventProcessor) {
+    return;
+  }
+
+  client.addEventProcessor(callback);
 }

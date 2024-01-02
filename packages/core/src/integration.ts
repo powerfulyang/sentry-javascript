@@ -1,7 +1,9 @@
-import type { Client, Event, EventHint, Integration, Options } from '@sentry/types';
+import type { Client, Event, EventHint, EventProcessor, Hub, Integration, IntegrationFn, Options } from '@sentry/types';
 import { arrayify, logger } from '@sentry/utils';
 
+import { DEBUG_BUILD } from './debug-build';
 import { addGlobalEventProcessor } from './eventProcessors';
+import { getClient } from './exports';
 import { getCurrentHub } from './hub';
 
 declare module '@sentry/types' {
@@ -44,7 +46,7 @@ function filterDuplicates(integrations: Integration[]): Integration[] {
 }
 
 /** Gets integrations to install */
-export function getIntegrationsToSetup(options: Options): Integration[] {
+export function getIntegrationsToSetup(options: Pick<Options, 'defaultIntegrations' | 'integrations'>): Integration[] {
   const defaultIntegrations = options.defaultIntegrations || [];
   const userIntegrations = options.integrations;
 
@@ -101,9 +103,16 @@ export function setupIntegrations(client: Client, integrations: Integration[]): 
 export function setupIntegration(client: Client, integration: Integration, integrationIndex: IntegrationIndex): void {
   integrationIndex[integration.name] = integration;
 
+  // `setupOnce` is only called the first time
   if (installedIntegrations.indexOf(integration.name) === -1) {
+    // eslint-disable-next-line deprecation/deprecation
     integration.setupOnce(addGlobalEventProcessor, getCurrentHub);
     installedIntegrations.push(integration.name);
+  }
+
+  // `setup` is run for each client
+  if (integration.setup && typeof integration.setup === 'function') {
+    integration.setup(client);
   }
 
   if (client.on && typeof integration.preprocessEvent === 'function') {
@@ -121,15 +130,15 @@ export function setupIntegration(client: Client, integration: Integration, integ
     client.addEventProcessor(processor);
   }
 
-  __DEBUG_BUILD__ && logger.log(`Integration installed: ${integration.name}`);
+  DEBUG_BUILD && logger.log(`Integration installed: ${integration.name}`);
 }
 
 /** Add an integration to the current hub's client. */
 export function addIntegration(integration: Integration): void {
-  const client = getCurrentHub().getClient();
+  const client = getClient();
 
   if (!client || !client.addIntegration) {
-    __DEBUG_BUILD__ && logger.warn(`Cannot add integration "${integration.name}" because no SDK Client is available.`);
+    DEBUG_BUILD && logger.warn(`Cannot add integration "${integration.name}" because no SDK Client is available.`);
     return;
   }
 
@@ -145,4 +154,39 @@ function findIndex<T>(arr: T[], callback: (item: T) => boolean): number {
   }
 
   return -1;
+}
+
+/**
+ * Convert a new integration function to the legacy class syntax.
+ * In v8, we can remove this and instead export the integration functions directly.
+ *
+ * @deprecated This will be removed in v8!
+ */
+export function convertIntegrationFnToClass<Fn extends IntegrationFn>(
+  name: string,
+  fn: Fn,
+): {
+  id: string;
+  new (...args: Parameters<Fn>): Integration &
+    ReturnType<Fn> & {
+      setupOnce: (addGlobalEventProcessor?: (callback: EventProcessor) => void, getCurrentHub?: () => Hub) => void;
+    };
+} {
+  return Object.assign(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    function ConvertedIntegration(...rest: Parameters<Fn>) {
+      return {
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        setupOnce: () => {},
+        ...fn(...rest),
+      };
+    },
+    { id: name },
+  ) as unknown as {
+    id: string;
+    new (...args: Parameters<Fn>): Integration &
+      ReturnType<Fn> & {
+        setupOnce: (addGlobalEventProcessor?: (callback: EventProcessor) => void, getCurrentHub?: () => Hub) => void;
+      };
+  };
 }

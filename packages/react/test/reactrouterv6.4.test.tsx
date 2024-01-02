@@ -2,12 +2,12 @@ import { render } from '@testing-library/react';
 import { Request } from 'node-fetch';
 import * as React from 'react';
 import {
+  Navigate,
+  RouterProvider,
   createMemoryRouter,
   createRoutesFromChildren,
   matchPath,
   matchRoutes,
-  Navigate,
-  RouterProvider,
   useLocation,
   useNavigationType,
 } from 'react-router-6.4';
@@ -34,7 +34,7 @@ describe('React Router v6.4', () => {
     };
     const mockFinish = jest.fn();
     const mockSetName = jest.fn();
-    const mockStartTransaction = jest.fn().mockReturnValue({ setName: mockSetName, finish: mockFinish });
+    const mockStartTransaction = jest.fn().mockReturnValue({ setName: mockSetName, end: mockFinish });
 
     reactRouterV6Instrumentation(
       React.useEffect,

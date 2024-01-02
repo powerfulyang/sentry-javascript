@@ -1,11 +1,18 @@
-import { getCurrentHub, getDynamicSamplingContextFromClient, isSentryRequestUrl } from '@sentry/core';
+import {
+  addBreadcrumb,
+  getClient,
+  getCurrentHub,
+  getCurrentScope,
+  getDynamicSamplingContextFromClient,
+  isSentryRequestUrl,
+} from '@sentry/core';
 import type { EventProcessor, Integration, Span } from '@sentry/types';
 import {
+  LRUMap,
   dynamicRequire,
   dynamicSamplingContextToSentryBaggageHeader,
   generateSentryTraceHeader,
   getSanitizedUrlString,
-  LRUMap,
   parseUrl,
   stringMatchesSomePattern,
 } from '@sentry/utils';
@@ -89,7 +96,7 @@ export class Undici implements Integration {
    */
   public setupOnce(_addGlobalEventProcessor: (callback: EventProcessor) => void): void {
     // Requires Node 16+ to use the diagnostics_channel API.
-    if (NODE_VERSION.major && NODE_VERSION.major < 16) {
+    if (NODE_VERSION.major < 16) {
       return;
     }
 
@@ -137,17 +144,17 @@ export class Undici implements Integration {
 
     const stringUrl = request.origin ? request.origin.toString() + request.path : request.path;
 
-    if (isSentryRequestUrl(stringUrl, hub) || request.__sentry_span__ !== undefined) {
-      return;
-    }
-
-    const client = hub.getClient<NodeClient>();
+    const client = getClient<NodeClient>();
     if (!client) {
       return;
     }
 
+    if (isSentryRequestUrl(stringUrl, client) || request.__sentry_span__ !== undefined) {
+      return;
+    }
+
     const clientOptions = client.getOptions();
-    const scope = hub.getScope();
+    const scope = getCurrentScope();
 
     const parentSpan = scope.getSpan();
 
@@ -197,18 +204,18 @@ export class Undici implements Integration {
 
     const stringUrl = request.origin ? request.origin.toString() + request.path : request.path;
 
-    if (isSentryRequestUrl(stringUrl, hub)) {
+    if (isSentryRequestUrl(stringUrl, getClient())) {
       return;
     }
 
     const span = request.__sentry_span__;
     if (span) {
       span.setHttpStatus(response.statusCode);
-      span.finish();
+      span.end();
     }
 
     if (this._options.breadcrumbs) {
-      hub.addBreadcrumb(
+      addBreadcrumb(
         {
           category: 'http',
           data: {
@@ -237,18 +244,18 @@ export class Undici implements Integration {
 
     const stringUrl = request.origin ? request.origin.toString() + request.path : request.path;
 
-    if (isSentryRequestUrl(stringUrl, hub)) {
+    if (isSentryRequestUrl(stringUrl, getClient())) {
       return;
     }
 
     const span = request.__sentry_span__;
     if (span) {
       span.setStatus('internal_error');
-      span.finish();
+      span.end();
     }
 
     if (this._options.breadcrumbs) {
-      hub.addBreadcrumb(
+      addBreadcrumb(
         {
           category: 'http',
           data: {

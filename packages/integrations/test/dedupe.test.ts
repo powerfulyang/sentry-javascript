@@ -1,6 +1,6 @@
 import type { Event as SentryEvent, Exception, StackFrame, Stacktrace } from '@sentry/types';
 
-import { _shouldDropEvent, Dedupe } from '../src/dedupe';
+import { Dedupe, _shouldDropEvent } from '../src/dedupe';
 
 type EventWithException = SentryEvent & {
   exception: {
@@ -10,7 +10,6 @@ type EventWithException = SentryEvent & {
 type ExceptionWithStacktrace = Exception & { stacktrace: StacktraceWithFrames };
 type StacktraceWithFrames = Stacktrace & { frames: StackFrame[] };
 
-/** JSDoc */
 function clone<T>(data: T): T {
   return JSON.parse(JSON.stringify(data));
 }

@@ -2,20 +2,19 @@ import type { Scope } from '@sentry/core';
 import { act, render } from '@testing-library/svelte';
 
 // linter doesn't like Svelte component imports
-// eslint-disable-next-line import/no-unresolved
 import DummyComponent from './components/Dummy.svelte';
 
 let returnUndefinedTransaction = false;
 
-const testTransaction: { spans: any[]; startChild: jest.Mock; finish: jest.Mock } = {
+const testTransaction: { spans: any[]; startChild: jest.Mock; end: jest.Mock } = {
   spans: [],
   startChild: jest.fn(),
-  finish: jest.fn(),
+  end: jest.fn(),
 };
-const testUpdateSpan = { finish: jest.fn() };
+const testUpdateSpan = { end: jest.fn() };
 const testInitSpan: any = {
   transaction: testTransaction,
-  finish: jest.fn(),
+  end: jest.fn(),
   startChild: jest.fn(),
 };
 
@@ -23,18 +22,12 @@ jest.mock('@sentry/core', () => {
   const original = jest.requireActual('@sentry/core');
   return {
     ...original,
-    getCurrentHub(): {
-      getScope(): Scope;
-    } {
+    getCurrentScope(): Scope {
       return {
-        getScope(): any {
-          return {
-            getTransaction: () => {
-              return returnUndefinedTransaction ? undefined : testTransaction;
-            },
-          };
+        getTransaction: () => {
+          return returnUndefinedTransaction ? undefined : testTransaction;
         },
-      };
+      } as Scope;
     },
   };
 });
@@ -54,7 +47,7 @@ describe('Sentry.trackComponent()', () => {
       return testUpdateSpan;
     });
 
-    testInitSpan.finish = jest.fn();
+    testInitSpan.end = jest.fn();
     testInitSpan.endTimestamp = undefined;
     returnUndefinedTransaction = false;
   });
@@ -74,14 +67,14 @@ describe('Sentry.trackComponent()', () => {
       origin: 'auto.ui.svelte',
     });
 
-    expect(testInitSpan.finish).toHaveBeenCalledTimes(1);
-    expect(testUpdateSpan.finish).toHaveBeenCalledTimes(1);
+    expect(testInitSpan.end).toHaveBeenCalledTimes(1);
+    expect(testUpdateSpan.end).toHaveBeenCalledTimes(1);
     expect(testTransaction.spans.length).toEqual(2);
   });
 
   it('creates an update span, when the component is updated', async () => {
-    // Make the finish() function actually end the initSpan
-    testInitSpan.finish.mockImplementation(() => {
+    // Make the end() function actually end the initSpan
+    testInitSpan.end.mockImplementation(() => {
       testInitSpan.endTimestamp = Date.now();
     });
 
@@ -114,7 +107,7 @@ describe('Sentry.trackComponent()', () => {
 
     expect(testInitSpan.startChild).not.toHaveBeenCalled();
 
-    expect(testInitSpan.finish).toHaveBeenCalledTimes(1);
+    expect(testInitSpan.end).toHaveBeenCalledTimes(1);
     expect(testTransaction.spans.length).toEqual(1);
   });
 
@@ -129,7 +122,7 @@ describe('Sentry.trackComponent()', () => {
 
     expect(testInitSpan.startChild).not.toHaveBeenCalled();
 
-    expect(testInitSpan.finish).toHaveBeenCalledTimes(1);
+    expect(testInitSpan.end).toHaveBeenCalledTimes(1);
     expect(testTransaction.spans.length).toEqual(1);
   });
 
@@ -158,8 +151,8 @@ describe('Sentry.trackComponent()', () => {
       origin: 'auto.ui.svelte',
     });
 
-    expect(testInitSpan.finish).toHaveBeenCalledTimes(1);
-    expect(testUpdateSpan.finish).toHaveBeenCalledTimes(1);
+    expect(testInitSpan.end).toHaveBeenCalledTimes(1);
+    expect(testUpdateSpan.end).toHaveBeenCalledTimes(1);
     expect(testTransaction.spans.length).toEqual(2);
   });
 
@@ -170,14 +163,14 @@ describe('Sentry.trackComponent()', () => {
       props: { options: { componentName: 'CustomComponentName' } },
     });
 
-    expect(testInitSpan.finish).toHaveBeenCalledTimes(0);
-    expect(testUpdateSpan.finish).toHaveBeenCalledTimes(0);
+    expect(testInitSpan.end).toHaveBeenCalledTimes(0);
+    expect(testUpdateSpan.end).toHaveBeenCalledTimes(0);
     expect(testTransaction.spans.length).toEqual(0);
   });
 
   it("doesn't record update spans, if there's no ongoing transaction at that time", async () => {
-    // Make the finish() function actually end the initSpan
-    testInitSpan.finish.mockImplementation(() => {
+    // Make the end() function actually end the initSpan
+    testInitSpan.end.mockImplementation(() => {
       testInitSpan.endTimestamp = Date.now();
     });
 
